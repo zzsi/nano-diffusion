@@ -15,6 +15,7 @@ import copy
 from datetime import datetime
 from pathlib import Path
 import os
+import time
 
 import torch
 import torch.optim as optim
@@ -63,7 +64,7 @@ def parse_arguments():
     parser.add_argument("--random_flip", action="store_true")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--checkpoint_dir", type=str, default="logs/sit")
-    parser.add_argument("--num_samples_for_logging", type=int, default=8)
+    parser.add_argument("--num_samples_for_logging", type=int, default=16)
     # Patch masking (Micro-Diffusion)
     parser.add_argument("--mask_ratio", type=float, default=0.0,
                         help="Fraction of patches to mask during training (0 = no masking, 0.75 = mask 75%%)")
@@ -149,19 +150,24 @@ def main():
     )
 
     # Logging
+    num_params = sum(p.numel() for p in model.parameters())
     if args.logger == "wandb":
         project = os.getenv("WANDB_PROJECT") or "nano-diffusion"
+        run_name = f"sit-{args.path_type}-{args.prediction}-{args.net}"
+        if args.mask_ratio > 0:
+            run_name += f"-mask{args.mask_ratio}"
         run_params = vars(args).copy()
-        run_params["model_parameters"] = sum(p.numel() for p in model.parameters())
+        run_params["model_parameters"] = num_params
         run_params["method"] = "sit"
-        wandb.init(project=project, config=run_params)
+        wandb.init(project=project, config=run_params, name=run_name)
 
     print(f"SiT training: path={args.path_type}, prediction={args.prediction}, "
           f"loss_weight={args.loss_weight}, mask_ratio={args.mask_ratio}")
-    print(f"Model params: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+    print(f"Model params: {num_params / 1e6:.2f}M")
 
     # Training loop
     step = 0
+    train_start = time.time()
     while step < args.total_steps:
         for x, _ in train_dataloader:
             if step >= args.total_steps:
@@ -177,8 +183,9 @@ def main():
                 loss = transport.training_losses(model, x)
 
             loss.backward()
+            grad_norm = None
             if args.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm).item()
             optimizer.step()
             lr_scheduler.step()
 
@@ -189,43 +196,75 @@ def main():
             # Logging
             if step % args.log_every == 0:
                 lr = optimizer.param_groups[0]["lr"]
-                msg = f"step {step} | loss {loss.item():.4f} | lr {lr:.2e}"
+                elapsed = time.time() - train_start
+                steps_per_sec = (step + 1) / elapsed if elapsed > 0 else 0
+                msg = f"step {step} | loss {loss.item():.4f} | lr {lr:.2e} | {steps_per_sec:.1f} steps/s"
                 print(msg)
                 if args.logger == "wandb":
-                    wandb.log({"loss": loss.item(), "lr": lr, "step": step})
+                    log_dict = {
+                        "train/loss": loss.item(),
+                        "train/learning_rate": lr,
+                        "train/steps_per_sec": steps_per_sec,
+                        "train/num_examples": step * args.batch_size,
+                    }
+                    if grad_norm is not None:
+                        log_dict["train/grad_norm"] = grad_norm
+                    wandb.log(log_dict, step=step)
 
             # Validation
             if step % args.validate_every == 0 and step > 0 and val_dataloader:
                 val_loss = compute_val_loss(model, val_dataloader, transport, device)
-                print(f"step {step} | val_loss {val_loss:.4f}")
+                log_dict_val = {"val/loss": val_loss}
+                print(f"step {step} | val_loss {val_loss:.4f}", end="")
+                if args.use_ema and ema_model is not None:
+                    ema_val_loss = compute_val_loss(ema_model, val_dataloader, transport, device)
+                    log_dict_val["val/ema_loss"] = ema_val_loss
+                    print(f" | ema_val_loss {ema_val_loss:.4f}", end="")
+                print()
                 if args.logger == "wandb":
-                    wandb.log({"val_loss": val_loss, "step": step})
+                    wandb.log(log_dict_val, step=step)
 
             # Sampling
-            if step % args.sample_every == 0:
+            if step > 0 and step % args.sample_every == 0:
                 model_to_sample = ema_model if args.use_ema else model
                 samples = generate_samples(model_to_sample, device, args)
-                grid = make_grid(samples, nrow=4)
+                grid = make_grid(samples, nrow=4, padding=2)
                 save_image(grid, checkpoint_dir / f"samples_step_{step}.png")
                 if args.logger == "wandb":
-                    images = (samples * 255).permute(0, 2, 3, 1).cpu().numpy().astype("uint8")
-                    wandb.log({"samples": [wandb.Image(img) for img in images], "step": step})
+                    images = (samples.clamp(0, 1) * 255).permute(0, 2, 3, 1).cpu().numpy().round().astype("uint8")
+                    wandb.log({
+                        "samples": [wandb.Image(img, caption=f"step {step} #{i}") for i, img in enumerate(images)],
+                        "sample_grid": wandb.Image(
+                            (grid.clamp(0, 1) * 255).permute(1, 2, 0).cpu().numpy().round().astype("uint8"),
+                            caption=f"Grid at step {step}",
+                        ),
+                    }, step=step)
 
             # Save
             if step % args.save_every == 0 and step > 0:
-                torch.save(model.state_dict(), checkpoint_dir / f"model_step_{step}.pt")
+                ckpt_path = checkpoint_dir / f"model_step_{step}.pt"
+                torch.save(model.state_dict(), ckpt_path)
                 if args.use_ema:
                     torch.save(ema_model.state_dict(), checkpoint_dir / f"ema_model_step_{step}.pt")
+                if args.logger == "wandb":
+                    wandb.save(str(ckpt_path))
 
             step += 1
 
     # Final save
     if step > 100:
-        torch.save(model.state_dict(), checkpoint_dir / "model_final.pt")
+        final_path = checkpoint_dir / "model_final.pt"
+        torch.save(model.state_dict(), final_path)
         if args.use_ema:
             torch.save(ema_model.state_dict(), checkpoint_dir / "ema_model_final.pt")
+        if args.logger == "wandb":
+            wandb.save(str(final_path))
 
-    print(f"SiT training complete. Checkpoints at {checkpoint_dir}")
+    total_time = time.time() - train_start
+    print(f"SiT training complete in {total_time/60:.1f}min. Checkpoints at {checkpoint_dir}")
+    if args.logger == "wandb":
+        wandb.log({"train/total_time_min": total_time / 60}, step=step)
+        wandb.finish()
 
 
 def _masked_train_step(model, x1, transport, args):
