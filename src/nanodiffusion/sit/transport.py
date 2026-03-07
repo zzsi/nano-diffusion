@@ -92,6 +92,58 @@ class Transport:
 
         return loss
 
+    def data_prediction_mse(self, model: nn.Module, x1: torch.Tensor, model_kwargs: Optional[dict] = None) -> torch.Tensor:
+        """Compute MSE of the model's x1 (data) prediction — comparable across prediction types and paths.
+
+        All prediction types (velocity, noise, score) are converted to a common x̂₁ prediction.
+        This gives a scale-invariant metric that can be used to compare runs with different
+        prediction types and path types.
+
+        Returns
+        -------
+        mse : scalar tensor, mean MSE(x̂₁, x₁) over the batch
+        """
+        if model_kwargs is None:
+            model_kwargs = {}
+
+        batch_size = x1.shape[0]
+        device = x1.device
+        t_min = max(self.t_min, 1e-3)  # avoid singularity for all prediction types
+
+        t = torch.rand(batch_size, device=device) * (1.0 - t_min) + t_min
+        x0 = torch.randn_like(x1)
+        x_t, _ = self.path.plan(t, x0, x1)
+
+        with torch.no_grad():
+            model_output = model(t=t, x=x_t, **model_kwargs)
+        if hasattr(model_output, "sample"):
+            model_output = model_output.sample
+
+        alpha_t, sigma_t, d_alpha_t, d_sigma_t = self.path.coefficients(t)
+        alpha_t = pad_t_like_x(alpha_t, x1)
+        sigma_t = pad_t_like_x(sigma_t, x1)
+        d_alpha_t = pad_t_like_x(d_alpha_t, x1)
+        d_sigma_t = pad_t_like_x(d_sigma_t, x1)
+
+        if self.prediction == "velocity":
+            # v̂ = d_α * x̂₁ + d_σ * x̂₀, x_t = α * x̂₁ + σ * x̂₀
+            # Solving: x̂₁ = (σ * v̂ - d_σ * x_t) / (σ * d_α - α * d_σ)
+            denom = (sigma_t * d_alpha_t - alpha_t * d_sigma_t).clamp(min=1e-6)
+            x1_pred = (sigma_t * model_output - d_sigma_t * x_t) / denom
+        elif self.prediction == "noise":
+            # Model predicts x̂₀ directly
+            x0_pred = model_output
+            x1_pred = (x_t - sigma_t * x0_pred) / alpha_t.clamp(min=1e-6)
+        elif self.prediction == "score":
+            # score = -x̂₀ / σ_t → x̂₀ = -score * σ_t
+            x0_pred = -model_output * sigma_t
+            x1_pred = (x_t - sigma_t * x0_pred) / alpha_t.clamp(min=1e-6)
+        else:
+            raise ValueError(f"Unknown prediction type: {self.prediction}")
+
+        mse = ((x1_pred - x1) ** 2).flatten(1).mean()
+        return mse
+
     def _weighted_mse(self, pred: torch.Tensor, target: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """Compute (possibly weighted) MSE loss."""
         mse = ((pred - target) ** 2).flatten(1).mean(dim=1)  # (N,)

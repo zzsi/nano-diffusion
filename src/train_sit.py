@@ -70,6 +70,11 @@ def parse_arguments():
                         help="Fraction of patches to mask during training (0 = no masking, 0.75 = mask 75%%)")
     parser.add_argument("--patch_mixer_depth", type=int, default=0,
                         help="Depth of patch-mixer for deferred masking (0 = no mixer)")
+    # Evaluation
+    parser.add_argument("--fid_every", type=int, default=0,
+                        help="Compute FID and IS every N steps (0 = disabled). Requires torch-fidelity.")
+    parser.add_argument("--num_samples_for_fid", type=int, default=2048,
+                        help="Number of generated samples for FID computation")
     args = parser.parse_args()
     return args
 
@@ -79,17 +84,89 @@ def update_ema(ema_model, model, beta):
         ema_p.data.mul_(beta).add_(p.data, alpha=1 - beta)
 
 
-def compute_val_loss(model, val_dataloader, transport, device):
+def compute_val_metrics(model, val_dataloader, transport, device):
+    """Compute validation loss + data-prediction MSE (comparable across prediction types/paths)."""
     total_loss = 0
+    total_dp_mse = 0
     n = 0
     model.eval()
     with torch.no_grad():
         for x, _ in val_dataloader:
             x = x.to(device)
-            loss = transport.training_losses(model, x)
-            total_loss += loss.item()
+            total_loss += transport.training_losses(model, x).item()
+            total_dp_mse += transport.data_prediction_mse(model, x).item()
             n += 1
-    return total_loss / max(n, 1)
+    return total_loss / max(n, 1), total_dp_mse / max(n, 1)
+
+
+def compute_fid_and_is(model, args, device, step):
+    """Compute FID and Inception Score using torch-fidelity.
+
+    Both metrics are scale-independent and directly comparable across
+    different prediction types, path types, and loss weightings.
+    """
+    try:
+        import torch_fidelity
+    except ImportError:
+        print("torch-fidelity not installed. Skipping FID/IS computation.")
+        return None, None
+
+    model.eval()
+    n = args.num_samples_for_fid
+    batch = 128
+    shape = (args.in_channels, args.resolution, args.resolution)
+
+    # Collect generated images as uint8 tensors
+    all_images = []
+    with torch.no_grad():
+        generated = 0
+        seed = step  # deterministic per step
+        while generated < n:
+            cur = min(batch, n - generated)
+            samples = euler_ode_sample(
+                model,
+                shape=(cur, *shape),
+                num_steps=args.sample_steps,
+                device=device,
+                seed=seed + generated,
+                prediction=args.prediction,
+                path_type=args.path_type,
+            )
+            # Convert [0,1] float to uint8
+            imgs = (samples.clamp(0, 1) * 255).to(torch.uint8).cpu()
+            all_images.append(imgs)
+            generated += cur
+
+    all_images = torch.cat(all_images, dim=0)[:n]
+
+    class TensorDataset(torch.utils.data.Dataset):
+        def __init__(self, t): self.t = t
+        def __len__(self): return len(self.t)
+        def __getitem__(self, i): return self.t[i]
+
+    ds = TensorDataset(all_images)
+    if args.dataset == "cifar10":
+        ref = "cifar10-train"
+    else:
+        ref = None  # skip FID for unknown datasets
+
+    try:
+        metrics = torch_fidelity.calculate_metrics(
+            input1=ds,
+            input2=ref,
+            cuda=True,
+            isc=True,
+            fid=(ref is not None),
+            verbose=False,
+            datasets_root=os.path.expanduser("~/.cache/torch_fidelity"),
+            datasets_download=True,
+        )
+        fid_score = metrics.get("frechet_inception_distance")
+        is_mean = metrics.get("inception_score_mean")
+        return fid_score, is_mean
+    except Exception as e:
+        print(f"FID/IS computation failed: {e}")
+        return None, None
 
 
 def generate_samples(model, device, args, seed=0):
@@ -213,16 +290,27 @@ def main():
 
             # Validation
             if step % args.validate_every == 0 and step > 0 and val_dataloader:
-                val_loss = compute_val_loss(model, val_dataloader, transport, device)
-                log_dict_val = {"val/loss": val_loss}
-                print(f"step {step} | val_loss {val_loss:.4f}", end="")
+                val_loss, val_dp_mse = compute_val_metrics(model, val_dataloader, transport, device)
+                log_dict_val = {"val/loss": val_loss, "val/data_pred_mse": val_dp_mse}
+                print(f"step {step} | val_loss {val_loss:.4f} | val_dp_mse {val_dp_mse:.4f}", end="")
                 if args.use_ema and ema_model is not None:
-                    ema_val_loss = compute_val_loss(ema_model, val_dataloader, transport, device)
+                    ema_val_loss, ema_dp_mse = compute_val_metrics(ema_model, val_dataloader, transport, device)
                     log_dict_val["val/ema_loss"] = ema_val_loss
-                    print(f" | ema_val_loss {ema_val_loss:.4f}", end="")
+                    log_dict_val["val/ema_data_pred_mse"] = ema_dp_mse
+                    print(f" | ema_dp_mse {ema_dp_mse:.4f}", end="")
                 print()
                 if args.logger == "wandb":
                     wandb.log(log_dict_val, step=step)
+
+            # FID and Inception Score
+            if args.fid_every > 0 and step > 0 and step % args.fid_every == 0:
+                model_to_eval = ema_model if args.use_ema else model
+                print(f"step {step} | computing FID and IS ({args.num_samples_for_fid} samples)...")
+                fid_score, is_score = compute_fid_and_is(model_to_eval, args, device, step)
+                if fid_score is not None:
+                    print(f"step {step} | FID={fid_score:.2f} | IS={is_score:.2f}")
+                    if args.logger == "wandb":
+                        wandb.log({"eval/fid": fid_score, "eval/inception_score": is_score}, step=step)
 
             # Sampling
             if step > 0 and step % args.sample_every == 0:
